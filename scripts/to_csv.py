@@ -17,9 +17,9 @@ import logging.handlers
 
 
 # put the path to the input file
-input_file_path = r"C:\Users\nayah\Downloads\reddit\subreddits23\ClimateActionPlan_submissions.zst"
+input_file_path = "ClimateOffensive_comments.zst"
 # put the path to the output file, with the csv extension
-output_file_path = r"C:\Users\nayah\Downloads\reddit\subreddits23\ClimateActionPlan_submissions.csv"
+output_file_path = "parsed_files/ClimateOffensive_comments.csv"
 # if you want a custom set of fields, put them in the following list. If you leave it empty the script will use a default set of fields
 fields = []
 
