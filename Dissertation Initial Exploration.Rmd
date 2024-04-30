@@ -1,0 +1,1939 @@
+---
+title: "Untitled"
+output: word_document
+date: "2024-04-21"
+---
+
+```{r packages}
+## Load packages
+library(tidyverse) #including ggplot, dplyr for pipes etc
+library(stringdist) # for basic character-based distance measures
+library(tidyverse) # loads dplyr, ggplot2, and others
+library(stringr) # to handle text elements
+library(statnet) #network creation
+library(quanteda) #to deal with text tokenising/find mentions 
+library(tm) # for text
+library(tidytext) # includes set of functions useful for manipulating text
+library(textdata)
+library(reshape2)# for conversion to edgelist
+library(quanteda.textstats)
+```
+
+After loading the packages, we take a look at subreddit sizes to see which ones to choose, given our focus on positive climate activism. We look at those with environment, climate, and green in the name, and find that only climate returns top results relevant to our focus. Hence, we focus on the top three explicitly activist ones here, and then add two well-known offline organisations: the (US) Green Party and Extinction Rebellion to diversify the dataset.
+
+```{r findingsubreddits}
+
+subreddit_sizes <- read.delim("subreddit_counts.txt") #using a document of subreddit sizes from the pushshift dataset, already sorted in decreasing order
+colnames(subreddit_sizes)<-c("reddit","size")
+
+tofindr<-c("climate")
+subreddits_climate_size<-subset(subreddit_sizes, grepl(paste(tofindr),reddit)) #we only take the ones that have climate in the name
+
+
+tofindr2<-c("environment")
+subreddits_environment_size<-subset(subreddit_sizes, grepl(paste(tofindr2),reddit)) #compare this to 
+
+tofindr3<-c("green")
+subreddits_green_size<-subset(subreddit_sizes, grepl(paste(tofindr3),reddit)) #look at subreddits as usernames are likely to be 
+
+subreddit_sizes_all<-cbind(head(subreddits_climate_size,n=10),head(subreddits_environment_size,n=10),head(subreddits_green_size,n=10))
+subreddit_sizes_all
+```
+
+For each of the networks, we make sure to account for deleted usernames and other sources of issues. We look solely at active users, in order to make the analysis simpler (read: less computationally expensive), and more meaningful: the choice of initial interaction/non-interaction is a valid study in itself, but outside the scope of this paper. We then create descriptive statistics for each of them, and compare them all to see structural differences and similarities.
+
+```{r exrebnetwork}
+
+#load data
+exreb_sub<-read.csv("C:/Users/nayah/Downloads/ExtinctionRebellion_submissions.csv")
+exreb_com<-read.csv("C:/Users/nayah/Downloads/ExtinctionRebellion_comments.csv")
+
+###explore by seeing both
+#View(exreb_com) #author, score, created (date), link, body
+#View(exreb_sub) #author, title, score, created (date), link, text, url
+
+#look at frequencies
+exreb_freq_com<-table(exreb_com$author)
+#same for submissions
+exreb_freq_sub<-table(exreb_sub$author)
+
+
+#fix dates to take away times
+exreb_com$date<- as.Date(strtrim(exreb_com$created, 10))
+exreb_sub$date<- as.Date(strtrim(exreb_sub$created, 10))
+
+#Distinguishing comments based on submissions they are part of: look at length of the common links manually:
+nchar("https://www.reddit.com/r/ExtinctionRebellion/comments/ay3qa1")
+#60
+
+#trim down links
+exreb_com$link<- strtrim(exreb_com$link, 59)
+
+#compare to submission links
+exreb_sub$link<- strtrim(exreb_sub$link, 59)
+
+#Compare lengths
+length(exreb_sub$link) #8513
+length(intersect(exreb_com$link,exreb_sub$link)) #5593
+
+#arrange
+
+arranged_exreb_com<-exreb_com%>%
+  group_by(author,date) %>% 
+  summarize(Freq=n())%>%
+  arrange(desc(Freq))%>%
+  head(n=50)
+
+arranged_exreb_sub<-exreb_sub%>%
+  group_by(author,date) %>% 
+  summarize(Freq=n())%>%
+  arrange(desc(Freq))%>%
+  head(n=50)
+
+
+#take away deleted usernames
+#note that deleted usernames speak to leaving the reddit community
+#however we still can't use them as nodes, as the author is not clear
+
+
+exreb_deleted_com<-filter(arranged_exreb_com, author == "u/[deleted]")
+exreb_deleted_sub<-filter(arranged_exreb_sub, author == "u/[deleted]")
+
+
+exreb_com<-mutate(exreb_com,type ="comment")
+exreb_com<- filter(exreb_com, author != "u/[deleted]")
+colnames(exreb_com)[colnames(exreb_com) == 'body'] <- 'text'
+#View(exreb_com)
+
+
+exreb_sub<-mutate(exreb_sub,type ="submission")
+exreb_sub<- filter(exreb_sub, author != "u/[deleted]")
+#View(exreb_sub)
+
+#CREATE EDGELIST #################################################
+#bring together the two data sets
+exreb<-rbind(
+  subset(exreb_sub, select = c("author","score","date","type","link","text")), 
+  subset(exreb_com, select = c("author","score","date","type","link","text"))
+)
+
+#keep only common links
+links_exreb<-intersect(exreb_com$link,exreb_sub$link)
+exreb<-exreb[exreb$link %in% links_exreb,]
+
+##EDGELIST###
+exreb_el <- data.frame(post=links_exreb,
+                       com=rep(NA,times=length(links_exreb)),
+                       sub=rep(NA,times=length(links_exreb)),
+                       edge=rep(1,times=length(links_exreb)),
+                       stringsAsFactors=FALSE)  # create empty dataframe with the different post ids (from links)
+
+exreb_el<-mutate(exreb_el, sub = ifelse(post %in% exreb_sub$link, exreb_sub$author, NA)) #add in sub
+exreb_el<-mutate(exreb_el, com = ifelse(post %in% exreb_com$link, exreb_com$author, NA)) # add in comm
+
+exreb_el<-exreb_el %>%
+  group_by(com, sub)%>%
+  summarize(weight = sum(edge))%>%
+  arrange(desc(weight))
+
+exreb_el_net<-network(exreb_el,directed = T,loops=T,matrix.type="edgelist") #create network
+
+network.density(exreb_el_net) 
+
+#CREATE NODE ATTRIBUTE NETWORK ###########################################
+
+#create starting point
+exreb_node<-select(exreb,c(author,score,date,type))
+
+#look at personal score over time
+exreb_score<-select(exreb,c(author,score,date,type))%>%
+  group_by(author,type)%>%
+  summarise(score=sum(score))%>%
+  pivot_wider(names_from = type,values_from = score)%>%
+  mutate(score_total=sum(comment,submission))%>%
+  rename(,score_comment=comment,score_submission=submission)
+
+#look at initial engagement (time in subreddit), and type of first engagement
+exreb_start<-exreb_node[match(unique(exreb_node$author), exreb_node$author),]%>%
+  arrange(,date)%>%
+  mutate(age=as.numeric(as.Date("2023-12-31")-date,unit="weeks"))%>%
+  dplyr::rename(first_engagement = type)# add age
+
+#join info together
+exreb_node<-full_join(exreb_score,exreb_start, by="author")
+
+#add frequency of both activities
+exreb_freq<-select(exreb,c(author,score,date,type))%>%
+  group_by(author,type)%>%
+  mutate(count=1)%>%
+  summarise(freq=sum(count))%>%
+  pivot_wider(names_from = type,values_from = freq)%>%
+  mutate(freq_total=sum(comment,submission))%>%
+  rename(,freq_comment=comment,freq_submission=submission)
+
+#join info together
+exreb_node<-full_join(exreb_node,exreb_freq, by="author")
+
+exreb_node[is.na(exreb_node)] <- 0 #deal with NA values by counting them as 0 weights.
+
+
+#add to network
+network.vertex.names(exreb_el_net) <- as.character(exreb_node$author)
+exreb_el_net %v% "Age" <- exreb_node$age
+exreb_el_net %v% "First Engagement" <- exreb_node$first_engagement
+exreb_el_net %v% "Score" <- exreb_node$score_total
+exreb_el_net %v% "Comment Frequency" <- exreb_node$freq_comment
+exreb_el_net %v% "Submission Frequency" <- exreb_node$freq_submission
+
+```
+
+```{r futolgnetwork}
+#load data
+futolg_sub <- read.csv("C:/Users/nayah/Downloads/Futurology_submissions.csv")
+futolg_com <- read.csv("C:/Users/nayah/Downloads/Futurology_comments.csv")
+
+###explore by seeing both
+#View(futolg_com) #author, score, created (date), link, body
+#View(futolg_sub) #author, title, score, created (date), link, text, url
+
+#look at frequencies
+futolg_freq_com <- table(futolg_com$author)
+#same for submissions
+futolg_freq_sub <- table(futolg_sub$author)
+
+
+#fix dates to take away times
+futolg_com$date <- as.Date(strtrim(futolg_com$created, 10))
+futolg_sub$date <- as.Date(strtrim(futolg_sub$created, 10))
+
+#Distinguishing comments based on submissions they are part of: look at length of the common links manually:
+nchar("https://www.reddit.com/r/ExtinctionRebellion/comments/ay3qa1")
+#60
+
+#trim down links
+futolg_com$link <- strtrim(futolg_com$link, 59)
+
+#compare to submission links
+futolg_sub$link <- strtrim(futolg_sub$link, 59)
+
+#Compare lengths
+length(futolg_sub$link) #8513
+length(intersect(futolg_com$link, futolg_sub$link)) #5593
+
+#arrange
+
+arranged_futolg_com <- futolg_com %>%
+  group_by(author, date) %>% 
+  summarize(Freq = n()) %>%
+  arrange(desc(Freq)) %>%
+  head(n = 50)
+
+arranged_futolg_sub <- futolg_sub %>%
+  group_by(author, date) %>% 
+  summarize(Freq = n()) %>%
+  arrange(desc(Freq)) %>%
+  head(n = 50)
+
+
+#take away deleted usernames
+#note that deleted usernames speak to leaving the reddit community
+#however we still can't use them as nodes, as the author is not clear
+
+
+futolg_deleted_com <- filter(arranged_futolg_com, author == "u/[deleted]")
+futolg_deleted_sub <- filter(arranged_futolg_sub, author == "u/[deleted]")
+
+
+futolg_com <- mutate(futolg_com, type = "comment")
+futolg_com <- filter(futolg_com, author != "u/[deleted]")
+colnames(futolg_com)[colnames(futolg_com) == 'body'] <- 'text'
+#View(futolg_com)
+
+
+futolg_sub <- mutate(futolg_sub, type = "submission")
+futolg_sub <- filter(futolg_sub, author != "u/[deleted]")
+#View(futolg_sub)
+
+#CREATE EDGELIST #################################################
+#bring together the two data sets
+futolg <- rbind(
+  subset(futolg_sub, select = c("author", "score", "date", "type", "link", "text")), 
+  subset(futolg_com, select = c("author", "score", "date", "type", "link", "text"))
+)
+
+#keep only common links
+links_futolg <- intersect(futolg_com$link, futolg_sub$link)
+futolg <- futolg[futolg$link %in% links_futolg,]
+
+##EDGELIST###
+futolg_el <- data.frame(post = links_futolg,
+                       com = rep(NA, times = length(links_futolg)),
+                       sub = rep(NA, times = length(links_futolg)),
+                       edge = rep(1, times = length(links_futolg)),
+                       stringsAsFactors = FALSE)  # create empty dataframe with the different post ids (from links)
+
+futolg_el <- mutate(futolg_el, sub = ifelse(post %in% futolg_sub$link, futolg_sub$author, NA)) #add in sub
+futolg_el <- mutate(futolg_el, com = ifelse(post %in% futolg_com$link, futolg_com$author, NA)) # add in comm
+
+futolg_el <- futolg_el %>%
+  group_by(com, sub) %>%
+  summarize(weight = sum(edge)) %>%
+  arrange(desc(weight))
+
+futolg_el_net <- network(futolg_el, directed = TRUE, loops = TRUE, matrix.type = "edgelist") #create network
+
+network.density(futolg_el_net) 
+
+#CREATE NODE ATTRIBUTE NETWORK ###########################################
+
+#create starting point
+futolg_node <- select(futolg, c(author, score, date, type))
+
+#look at personal score over time
+futolg_score <- select(futolg, c(author, score, date, type)) %>%
+  group_by(author, type) %>%
+  summarise(score = sum(score)) %>%
+  pivot_wider(names_from = type, values_from = score) %>%
+  mutate(score_total = sum(comment, submission)) %>%
+  rename(, score_comment = comment, score_submission = submission)
+
+#look at initial engagement (time in subreddit), and type of first engagement
+futolg_start <- futolg_node[match(unique(futolg_node$author), futolg_node$author),] %>%
+  arrange(, date) %>%
+  mutate(age = as.numeric(as.Date("2023-12-31") - date, unit = "weeks")) %>%
+  dplyr::rename(first_engagement = type) # add age
+
+#join info together
+futolg_node <- full_join(futolg_score, futolg_start, by = "author")
+
+#add frequency of both activities
+futolg_freq <- select(futolg, c(author, score, date, type)) %>%
+  group_by(author, type) %>%
+  mutate(count = 1) %>%
+  summarise(freq = sum(count)) %>%
+  pivot_wider(names_from = type, values_from = freq) %>%
+  mutate(freq_total = sum(comment, submission)) %>%
+  rename(, freq_comment = comment, freq_submission = submission)
+
+#join info together
+futolg_node <- full_join(futolg_node, futolg_freq, by = "author")
+
+futolg_node[is.na(futolg_node)] <- 0 #deal with NA values by counting them as 0 weights.
+
+
+#add to network
+network.vertex.names(futolg_el_net) <- as.character(futolg_node$author)
+futolg_el_net %v% "Age" <- futolg_node$age
+futolg_el_net %v% "First Engagement" <- futolg_node$first_engagement
+futolg_el_net %v% "Score" <- futolg_node$score_total
+futolg_el_net %v% "Comment Frequency" <- futolg_node$freq_comment
+futolg_el_net %v% "Submission Frequency" <- futolg_node$freq_submission
+
+```
+```{r descstatexreb}
+rownames<-c("number of posts","number of comments","number of authors","average path length","outdegree","density","edgewise","dyadic","closeness","betweenness")
+library(igraph)
+exreb_igraph<-graph.edgelist(as.matrix(exreb_el[,1:2]))
+dist_exreb<-mean_distance(exreb_igraph)
+detach("package:igraph")
+
+exreb_values<-c(nrow(exreb_sub),nrow(exreb_com),length(exreb_node$author),dist_exreb,mean(degree(exreb_el_net,cmode="outdegree")),network.density(exreb_el_net),grecip(exreb_el_net, measure="edgewise"),grecip(exreb_el_net, measure="dyadic"),centralization(exreb_el_net, mode = "digraph",FUN = "closeness"),centralization(exreb_el_net, mode = "digraph",FUN = "betweenness"))
+
+descriptive_exreb<-data.frame(rownames,exreb_values)
+```
+
+```{r greparnetwork}
+
+#load data
+grepar_sub<-read.csv("C:/Users/nayah/Downloads/GreenParty_submissions.csv")
+grepar_com<-read.csv("C:/Users/nayah/Downloads/GreenParty_comments.csv")
+
+###explore by seeing both
+#View(grepar_com) #author, score, created (date), link, body
+#View(grepar_sub) #author, title, score, created (date), link, text, url
+
+#look at frequencies
+grepar_freq_com<-table(grepar_com$author)
+#same for submissions
+grepar_freq_sub<-table(grepar_sub$author)
+#view results to see:
+summary(grepar_freq_sub)
+summary(grepar_freq_com)
+
+#8513 people submitted
+#58806 people commented
+
+#fix dates to take away times
+grepar_com$date<- as.Date(strtrim(grepar_com$created, 10))
+grepar_sub$date<- as.Date(strtrim(grepar_sub$created, 10))
+
+#Distinguishing comments based on submissions they are part of: look at length of the common links manually:
+nchar("https://www.reddit.com/r/ExtinctionRebellion/comments/ay3qa1")
+#60
+
+#trim down links
+grepar_com$link<- strtrim(grepar_com$link, 59)
+
+#compare to submission links
+grepar_sub$link<- strtrim(grepar_sub$link, 59)
+
+#Compare lengths
+length(grepar_sub$link) #8513
+length(intersect(grepar_com$link,grepar_sub$link)) #5593
+
+###########LOOK AT DELETED USERNAMES ########
+
+###Frequencies
+
+arranged_grepar_com<-grepar_com%>%
+  group_by(author,date) %>% 
+  summarize(Freq=n())%>%
+  arrange(desc(Freq))%>%
+  head(n=50)
+
+arranged_grepar_sub<-grepar_sub%>%
+  group_by(author,date) %>% 
+  summarize(Freq=n())%>%
+  arrange(desc(Freq))%>%
+  head(n=50)
+
+#View(arranged_grepar_com)
+
+####
+
+#take away deleted usernames
+#note that deleted usernames speak to leaving the reddit community
+#however we still can't use them as nodes, as the author is not clear
+
+
+grepar_deleted_com<-filter(arranged_grepar_com, author == "u/[deleted]")
+grepar_deleted_sub<-filter(arranged_grepar_sub, author == "u/[deleted]")
+
+sum(grepar_deleted_com$Freq) #600
+sum(grepar_deleted_sub$Freq) #112
+
+#which is is this proportion (hard to look at otherwise because affected by frequency)
+
+sum(grepar_deleted_com$Freq)/sum(arranged_grepar_com$Freq) #0.37
+sum(grepar_deleted_sub$Freq)/sum(arranged_grepar_sub$Freq) #0.35
+
+#this is very high.
+#take out deleted authors and add type
+
+grepar_com<-mutate(grepar_com,type ="comment")
+grepar_com<- filter(grepar_com, author != "u/[deleted]")
+colnames(grepar_com)[colnames(grepar_com) == 'body'] <- 'text'
+#View(grepar_com)
+
+
+grepar_sub<-mutate(grepar_sub,type ="submission")
+grepar_sub<- filter(grepar_sub, author != "u/[deleted]")
+#View(grepar_sub)
+
+#CREATE EDGELIST #################################################
+
+
+#bring together the two data sets
+grepar<-rbind(
+  subset(grepar_sub, select = c("author","score","date","type","link","text")), 
+  subset(grepar_com, select = c("author","score","date","type","link","text"))
+)
+
+#keep only common links
+links_grepar<-intersect(grepar_com$link,grepar_sub$link)
+grepar<-grepar[grepar$link %in% links_grepar,]
+
+##EDGELIST###
+grepar_el <- data.frame(post=links_grepar,
+                        com=rep(NA,times=length(links_grepar)),
+                        sub=rep(NA,times=length(links_grepar)),
+                        edge=rep(1,times=length(links_grepar)),
+                        stringsAsFactors=FALSE)  # create empty dataframe with the different post ids (from links)
+
+grepar_el<-mutate(grepar_el, sub = ifelse(post %in% grepar_sub$link, grepar_sub$author, NA)) #add in sub
+grepar_el<-mutate(grepar_el, com = ifelse(post %in% grepar_com$link, grepar_com$author, NA)) # add in comm
+
+grepar_el<-grepar_el %>%
+  group_by(com, sub)%>%
+  summarize(weight = sum(edge))%>%
+  arrange(desc(weight))
+
+grepar_el_net<-network(grepar_el,directed = T,loops=T,matrix.type="edgelist") #create network
+
+network.density(grepar_el_net) #look at density for test
+#note that this is only even of active users
+
+#CREATE NODE ATTRIBUTE NETWORK ###########################################
+
+#create starting point
+grepar_node<-select(grepar,c(author,score,date,type))
+
+#look at personal score over time
+grepar_score<-select(grepar,c(author,score,date,type))%>%
+  group_by(author,type)%>%
+  summarise(score=sum(score))%>%
+  pivot_wider(names_from = type,values_from = score)%>%
+  mutate(score_total=sum(comment,submission))%>%
+  rename(,score_comment=comment,score_submission=submission)
+
+#look at initial engagement (time in subreddit), and type of first engagement
+grepar_start<-grepar_node[match(unique(grepar_node$author), grepar_node$author),]%>%
+  arrange(,date)%>%
+  mutate(age=as.numeric(as.Date("2023-12-31")-date,unit="weeks"))%>%
+  dplyr::rename(first_engagement = type)# add age
+
+#join info together
+grepar_node<-full_join(grepar_score,grepar_start, by="author")
+
+#add frequency of both activities
+grepar_freq<-select(grepar,c(author,score,date,type))%>%
+  group_by(author,type)%>%
+  mutate(count=1)%>%
+  summarise(freq=sum(count))%>%
+  pivot_wider(names_from = type,values_from = freq)%>%
+  mutate(freq_total=sum(comment,submission))%>%
+  rename(,freq_comment=comment,freq_submission=submission)
+
+
+#join info together
+grepar_node<-full_join(grepar_node,grepar_freq, by="author")
+
+grepar_node[is.na(grepar_node)] <- 0 #deal with NA values by counting them as 0 weights.
+
+
+#add to network
+network.vertex.names(grepar_el_net) <- as.character(grepar_node$author)
+grepar_el_net %v% "Age" <- grepar_node$age
+grepar_el_net %v% "First Engagement" <- grepar_node$first_engagement
+grepar_el_net %v% "Score" <- grepar_node$score_total
+grepar_el_net %v% "Comment Frequency" <- grepar_node$freq_comment
+grepar_el_net %v% "Submission Frequency" <- grepar_node$freq_submission
+```
+
+```{r descstatgrepar}
+
+rownames<-c("number of posts","number of comments","number of authors","average path length","outdegree","density","edgewise","dyadic","closeness","betweenness")
+
+library(igraph)
+grepar_igraph<-graph.edgelist(as.matrix(grepar_el[,1:2]))
+dist_grepar<-mean_distance(grepar_igraph)
+detach("package:igraph")
+
+grepar_values<-c(nrow(grepar_sub),nrow(grepar_com),length(grepar_node$author),dist_grepar,mean(degree(grepar_el_net,cmode="outdegree")),network.density(grepar_el_net),grecip(grepar_el_net, measure="edgewise"),grecip(grepar_el_net, measure="dyadic"),centralization(grepar_el_net, mode = "digraph",FUN = "closeness"),centralization(grepar_el_net, mode = "digraph",FUN = "betweenness"))
+descriptive_grepar<-data.frame(rownames,grepar_values)
+
+```
+
+```{r clchaosnetwork}
+
+#load data
+clchaos_sub<-read.csv("C:/Users/nayah/Downloads/ClimateChaos_submissions.csv")
+clchaos_com<-read.csv("C:/Users/nayah/Downloads/ClimateChaos_comments.csv")
+
+###explore by seeing both
+#View(clchaos_com) #author, score, created (date), link, body
+#View(clchaos_sub) #author, title, score, created (date), link, text, url
+
+#look at frequencies
+clchaos_freq_com<-table(clchaos_com$author)
+#same for submissions
+clchaos_freq_sub<-table(clchaos_sub$author)
+#view results to see:
+summary(clchaos_freq_sub)
+summary(clchaos_freq_com)
+
+#8513 people submitted
+#58806 people commented
+
+#fix dates to take away times
+clchaos_com$date<- as.Date(strtrim(clchaos_com$created, 10))
+clchaos_sub$date<- as.Date(strtrim(clchaos_sub$created, 10))
+
+#Distinguishing comments based on submissions they are part of: look at length of the common links manually:
+nchar("https://www.reddit.com/r/ExtinctionRebellion/comments/ay3qa1")
+#60
+
+#trim down links
+clchaos_com$link<- strtrim(clchaos_com$link, 59)
+
+#compare to submission links
+clchaos_sub$link<- strtrim(clchaos_sub$link, 59)
+
+#Compare lengths
+length(clchaos_sub$link) #8513
+length(intersect(clchaos_com$link,clchaos_sub$link)) #5593
+
+###########LOOK AT DELETED USERNAMES ########
+
+###Frequencies
+
+arranged_clchaos_com<-clchaos_com%>%
+  group_by(author,date) %>% 
+  summarize(Freq=n())%>%
+  arrange(desc(Freq))%>%
+  head(n=50)
+
+arranged_clchaos_sub<-clchaos_sub%>%
+  group_by(author,date) %>% 
+  summarize(Freq=n())%>%
+  arrange(desc(Freq))%>%
+  head(n=50)
+
+#View(arranged_clchaos_com)
+
+####
+
+#take away deleted usernames
+#note that deleted usernames speak to leaving the reddit community
+#however we still can't use them as nodes, as the author is not clear
+
+
+clchaos_deleted_com<-filter(arranged_clchaos_com, author == "u/[deleted]")
+clchaos_deleted_sub<-filter(arranged_clchaos_sub, author == "u/[deleted]")
+
+sum(clchaos_deleted_com$Freq) #600
+sum(clchaos_deleted_sub$Freq) #112
+
+#which is is this proportion (hard to look at otherwise because affected by frequency)
+
+sum(clchaos_deleted_com$Freq)/sum(arranged_clchaos_com$Freq) #0.37
+sum(clchaos_deleted_sub$Freq)/sum(arranged_clchaos_sub$Freq) #0.35
+
+#this is very high.
+#take out deleted authors and add type
+
+clchaos_com<-mutate(clchaos_com,type ="comment")
+clchaos_com<- filter(clchaos_com, author != "u/[deleted]")
+colnames(clchaos_com)[colnames(clchaos_com) == 'body'] <- 'text'
+#View(clchaos_com)
+
+
+clchaos_sub<-mutate(clchaos_sub,type ="submission")
+clchaos_sub<- filter(clchaos_sub, author != "u/[deleted]")
+#View(clchaos_sub)
+
+#CREATE EDGELIST #################################################
+
+
+#bring together the two data sets
+
+
+clchaos<-rbind(
+  subset(clchaos_sub, select = c("author","score","date","type","link","text")), 
+  subset(clchaos_com, select = c("author","score","date","type","link","text"))
+)
+
+#keep only common links
+links_clchaos<-intersect(clchaos_com$link,clchaos_sub$link)
+clchaos<-clchaos[clchaos$link %in% links_clchaos,]
+
+##EDGELIST###
+clchaos_el <- data.frame(post=links_clchaos,
+                         com=rep(NA,times=length(links_clchaos)),
+                         sub=rep(NA,times=length(links_clchaos)),
+                         edge=rep(1,times=length(links_clchaos)),
+                         stringsAsFactors=FALSE)  # create empty dataframe with the different post ids (from links)
+
+clchaos_el<-mutate(clchaos_el, sub = ifelse(post %in% clchaos_sub$link, clchaos_sub$author, NA)) #add in sub
+clchaos_el<-mutate(clchaos_el, com = ifelse(post %in% clchaos_com$link, clchaos_com$author, NA)) # add in comm
+
+clchaos_el<-clchaos_el %>%
+  group_by(com, sub)%>%
+  summarize(weight = sum(edge))%>%
+  arrange(desc(weight))
+
+clchaos_el_net<-network(clchaos_el,directed = T,loops=T,matrix.type="edgelist") #create network
+
+network.density(clchaos_el_net) #look at density for test
+#note that this is only even of active users
+
+#CREATE NODE ATTRIBUTE NETWORK ###########################################
+
+#create starting point
+clchaos_node<-select(clchaos,c(author,score,date,type))
+
+#look at personal score over time
+clchaos_score<-select(clchaos,c(author,score,date,type))%>%
+  group_by(author,type)%>%
+  summarise(score=sum(score))%>%
+  pivot_wider(names_from = type,values_from = score)%>%
+  mutate(score_total=sum(comment,submission))%>%
+  rename(,score_comment=comment,score_submission=submission)
+
+#look at initial engagement (time in subreddit), and type of first engagement
+clchaos_start<-clchaos_node[match(unique(clchaos_node$author), clchaos_node$author),]%>%
+  arrange(,date)%>%
+  mutate(age=as.numeric(as.Date("2023-12-31")-date,unit="weeks"))%>%
+  dplyr::rename(first_engagement = type)# add age
+
+#join info together
+clchaos_node<-full_join(clchaos_score,clchaos_start, by="author")
+
+#add frequency of both activities
+clchaos_freq<-select(clchaos,c(author,score,date,type))%>%
+  group_by(author,type)%>%
+  mutate(count=1)%>%
+  summarise(freq=sum(count))%>%
+  pivot_wider(names_from = type,values_from = freq)%>%
+  mutate(freq_total=sum(comment,submission))%>%
+  rename(,freq_comment=comment,freq_submission=submission)
+
+
+#join info together
+clchaos_node<-full_join(clchaos_node,clchaos_freq, by="author")
+
+clchaos_node[is.na(clchaos_node)] <- 0 #deal with NA values by counting them as 0 weights.
+
+
+#add to network
+network.vertex.names(clchaos_el_net) <- as.character(clchaos_node$author)
+clchaos_el_net %v% "Age" <- clchaos_node$age
+clchaos_el_net %v% "First Engagement" <- clchaos_node$first_engagement
+clchaos_el_net %v% "Score" <- clchaos_node$score_total
+clchaos_el_net %v% "Comment Frequency" <- clchaos_node$freq_comment
+clchaos_el_net %v% "Submission Frequency" <- clchaos_node$freq_submission
+```
+
+```{r descstatclchaos}
+rownames<-c("number of posts","number of comments","number of authors","average path length","outdegree","density","edgewise","dyadic","closeness","betweenness")
+
+library(igraph)
+clchaos_igraph<-graph.edgelist(as.matrix(clchaos_el[,1:2]))
+dist_clchaos<-mean_distance(clchaos_igraph)
+detach("package:igraph")
+
+clchaos_values<-c(nrow(clchaos_sub),nrow(clchaos_com),length(clchaos_node$author),dist_clchaos,mean(degree(clchaos_el_net,cmode="outdegree")),network.density(clchaos_el_net),grecip(clchaos_el_net, measure="edgewise"),grecip(clchaos_el_net, measure="dyadic"),centralization(clchaos_el_net, mode = "digraph",FUN = "closeness"),centralization(clchaos_el_net, mode = "digraph",FUN = "betweenness"))
+
+descriptive_clchaos<-data.frame(rownames,clchaos_values)
+
+```
+
+```{r cliactnetwork}
+
+#load data
+cliact_sub<-read.csv("C:/Users/nayah/Downloads/ClimateActionPlan_submissions.csv")
+cliact_com<-read.csv("C:/Users/nayah/Downloads/ClimateActionPlan_comments.csv")
+
+###explore by seeing both
+#View(cliact_com) #author, score, created (date), link, body
+#View(cliact_sub) #author, title, score, created (date), link, text, url
+
+#look at frequencies
+cliact_freq_com<-table(cliact_com$author)
+#same for submissions
+cliact_freq_sub<-table(cliact_sub$author)
+#view results to see:
+summary(cliact_freq_sub)
+summary(cliact_freq_com)
+
+#8513 people submitted
+#58806 people commented
+
+#fix dates to take away times
+cliact_com$date<- as.Date(strtrim(cliact_com$created, 10))
+cliact_sub$date<- as.Date(strtrim(cliact_sub$created, 10))
+
+#Distinguishing comments based on submissions they are part of: look at length of the common links manually:
+nchar("https://www.reddit.com/r/ExtinctionRebellion/comments/ay3qa1")
+#60
+
+#trim down links
+cliact_com$link<- strtrim(cliact_com$link, 59)
+
+#compare to submission links
+cliact_sub$link<- strtrim(cliact_sub$link, 59)
+
+#Compare lengths
+length(cliact_sub$link) #8513
+length(intersect(cliact_com$link,cliact_sub$link)) #5593
+
+###########LOOK AT DELETED USERNAMES ########
+
+###Frequencies
+
+arranged_cliact_com<-cliact_com%>%
+  group_by(author,date) %>% 
+  summarize(Freq=n())%>%
+  arrange(desc(Freq))%>%
+  head(n=50)
+
+arranged_cliact_sub<-cliact_sub%>%
+  group_by(author,date) %>% 
+  summarize(Freq=n())%>%
+  arrange(desc(Freq))%>%
+  head(n=50)
+
+#View(arranged_cliact_com)
+
+####
+
+#take away deleted usernames
+#note that deleted usernames speak to leaving the reddit community
+#however we still can't use them as nodes, as the author is not clear
+
+
+cliact_deleted_com<-filter(arranged_cliact_com, author == "u/[deleted]")
+cliact_deleted_sub<-filter(arranged_cliact_sub, author == "u/[deleted]")
+
+sum(cliact_deleted_com$Freq) #600
+sum(cliact_deleted_sub$Freq) #112
+
+#which is is this proportion (hard to look at otherwise because affected by frequency)
+
+sum(cliact_deleted_com$Freq)/sum(arranged_cliact_com$Freq) #0.37
+sum(cliact_deleted_sub$Freq)/sum(arranged_cliact_sub$Freq) #0.35
+
+#this is very high.
+#take out deleted authors and add type
+
+cliact_com<-mutate(cliact_com,type ="comment")
+cliact_com<- filter(cliact_com, author != "u/[deleted]")
+colnames(cliact_com)[colnames(cliact_com) == 'body'] <- 'text'
+
+#View(cliact_com)
+
+
+cliact_sub<-mutate(cliact_sub,type ="submission")
+cliact_sub<- filter(cliact_sub, author != "u/[deleted]")
+#View(cliact_sub)
+
+#CREATE EDGELIST #################################################
+
+
+#bring together the two data sets
+cliact<-rbind(
+  subset(cliact_sub, select = c("author","score","date","type","link","text")), 
+  subset(cliact_com, select = c("author","score","date","type","link","text"))
+)
+
+#keep only common links
+links_cliact<-intersect(cliact_com$link,cliact_sub$link)
+cliact<-cliact[cliact$link %in% links_cliact,]
+
+##EDGELIST###
+cliact_el <- data.frame(post=links_cliact,
+                        com=rep(NA,times=length(links_cliact)),
+                        sub=rep(NA,times=length(links_cliact)),
+                        edge=rep(1,times=length(links_cliact)),
+                        stringsAsFactors=FALSE)  # create empty dataframe with the different post ids (from links)
+
+cliact_el<-mutate(cliact_el, sub = ifelse(post %in% cliact_sub$link, cliact_sub$author, NA)) #add in sub
+cliact_el<-mutate(cliact_el, com = ifelse(post %in% cliact_com$link, cliact_com$author, NA)) # add in comm
+
+cliact_el<-cliact_el %>%
+  group_by(com, sub)%>%
+  summarize(weight = sum(edge))%>%
+  arrange(desc(weight))
+
+cliact_el_net<-network(cliact_el,directed = T,loops=T,matrix.type="edgelist") #create network
+
+network.density(cliact_el_net) #look at density for test
+#note that this is only even of active users
+
+#CREATE NODE ATTRIBUTE NETWORK ###########################################
+
+#create starting point
+cliact_node<-select(cliact,c(author,score,date,type))
+
+#look at personal score over time
+cliact_score<-select(cliact,c(author,score,date,type))%>%
+  group_by(author,type)%>%
+  summarise(score=sum(score))%>%
+  pivot_wider(names_from = type,values_from = score)%>%
+  mutate(score_total=sum(comment,submission))%>%
+  rename(,score_comment=comment,score_submission=submission)
+
+#look at initial engagement (time in subreddit), and type of first engagement
+cliact_start<-cliact_node[match(unique(cliact_node$author), cliact_node$author),]%>%
+  arrange(,date)%>%
+  mutate(age=as.numeric(as.Date("2023-12-31")-date,unit="weeks"))%>%
+  dplyr::rename(first_engagement = type)# add age
+
+#join info together
+cliact_node<-full_join(cliact_score,cliact_start, by="author")
+
+#add frequency of both activities
+cliact_freq<-select(cliact,c(author,score,date,type))%>%
+  group_by(author,type)%>%
+  mutate(count=1)%>%
+  summarise(freq=sum(count))%>%
+  pivot_wider(names_from = type,values_from = freq)%>%
+  mutate(freq_total=sum(comment,submission))%>%
+  rename(,freq_comment=comment,freq_submission=submission)
+
+
+#join info together
+cliact_node<-full_join(cliact_node,cliact_freq, by="author")
+
+cliact_node[is.na(cliact_node)] <- 0 #deal with NA values by counting them as 0 weights.
+
+
+#add to network
+network.vertex.names(cliact_el_net) <- as.character(cliact_node$author)
+cliact_el_net %v% "Age" <- cliact_node$age
+cliact_el_net %v% "First Engagement" <- cliact_node$first_engagement
+cliact_el_net %v% "Score" <- cliact_node$score_total
+cliact_el_net %v% "Comment Frequency" <- cliact_node$freq_comment
+cliact_el_net %v% "Submission Frequency" <- cliact_node$freq_submission
+
+```
+
+```{r descstatcliact}
+rownames<-c("number of posts","number of comments","number of authors","average path length","outdegree","density","edgewise","dyadic","closeness","betweenness")
+
+library(igraph)
+cliact_igraph<-graph.edgelist(as.matrix(cliact_el[,1:2]))
+dist_cliact<-mean_distance(cliact_igraph)
+detach("package:igraph")
+
+cliact_values<-c(nrow(cliact_sub),nrow(cliact_com),length(cliact_node$author),dist_cliact,mean(degree(cliact_el_net,gmode="digraph",cmode="outdegree")),network.density(cliact_el_net),grecip(cliact_el_net, measure="edgewise"),grecip(cliact_el_net, measure="dyadic"),centralization(cliact_el_net, mode = "digraph",FUN = "closeness"),centralization(cliact_el_net, mode = "digraph",FUN = "betweenness"))
+
+descriptive_cliact<-data.frame(rownames,cliact_values)
+
+```
+
+```{r climoffnetwork}
+#load data
+climoff_sub<-read.csv("C:/Users/nayah/Downloads/ClimateOffensive_submissions.csv")
+climoff_com<-read.csv("C:/Users/nayah/Downloads/ClimateOffensive_comments.csv")
+
+###explore by seeing both
+#View(climoff_com) #author, score, created (date), link, body
+#View(climoff_sub) #author, title, score, created (date), link, text, url
+
+#look at frequencies
+climoff_freq_com<-table(climoff_com$author)
+#same for submissions
+climoff_freq_sub<-table(climoff_sub$author)
+#view results to see:
+summary(climoff_freq_sub)
+summary(climoff_freq_com)
+
+#8513 people submitted
+#58806 people commented
+
+#fix dates to take away times
+climoff_com$date<- as.Date(strtrim(climoff_com$created, 10))
+climoff_sub$date<- as.Date(strtrim(climoff_sub$created, 10))
+
+#Distinguishing comments based on submissions they are part of: look at length of the common links manually:
+nchar("https://www.reddit.com/r/ExtinctionRebellion/comments/ay3qa1")
+#60
+
+#trim down links
+climoff_com$link<- strtrim(climoff_com$link, 58)
+
+#compare to submission links
+climoff_sub$link<- strtrim(climoff_sub$link, 58)
+
+#Compare lengths
+length(climoff_sub$link) #11172
+length(intersect(climoff_com$link,climoff_sub$link)) #7164
+
+
+###Frequencies
+
+arranged_climoff_com<-climoff_com%>%
+  group_by(author,date) %>% 
+  summarize(Freq=n())%>%
+  arrange(desc(Freq))%>%
+  head(n=50)
+
+arranged_climoff_sub<-climoff_sub%>%
+  group_by(author,date) %>% 
+  summarize(Freq=n())%>%
+  arrange(desc(Freq))%>%
+  head(n=50)
+
+
+#take away deleted usernames
+#note that deleted usernames speak to leaving the reddit community
+#however we still can't use them as nodes, as the author is not clear
+
+
+climoff_deleted_com<-filter(arranged_climoff_com, author == "u/[deleted]")
+climoff_deleted_sub<-filter(arranged_climoff_sub, author == "u/[deleted]")
+
+sum(climoff_deleted_com$Freq) #600
+sum(climoff_deleted_sub$Freq) #112
+
+#which is is this proportion (hard to look at otherwise because affected by frequency)
+
+sum(climoff_deleted_com$Freq)/sum(arranged_climoff_com$Freq) #0.37
+sum(climoff_deleted_sub$Freq)/sum(arranged_climoff_sub$Freq) #0.35
+
+
+#this is very high.
+#take out deleted authors and add type
+
+climoff_com<-mutate(climoff_com,type ="comment")
+climoff_com<- filter(climoff_com, author != "u/[deleted]")
+climoff_com<-climoff_com%>%rename(text=body)
+#View(climoff_com)
+
+
+climoff_sub<-mutate(climoff_sub,type ="submission")
+climoff_sub<- filter(climoff_sub, author != "u/[deleted]")
+#View(climoff_sub)
+
+#CREATE EDGELIST ################################################
+#bring together the two data sets
+climoff<-rbind(
+  subset(climoff_sub, select = c("author","score","date","type","link","text")), 
+  subset(climoff_com, select = c("author","score","date","type","link","text"))
+)
+
+#keep only common links
+links_climoff<-intersect(climoff_com$link,climoff_sub$link)
+climoff<-climoff[climoff$link %in% links_climoff,]
+head(climoff)
+####nrow(climoff)
+#####nrow(unique(climoff))
+
+##EDGELIST###
+climoff_el <- data.frame(post=links_climoff,
+                         com=rep(NA,times=length(links_climoff)),
+                         sub=rep(NA,times=length(links_climoff)),
+                         edge=rep(1,times=length(links_climoff)),
+                         stringsAsFactors=FALSE)  # create empty dataframe with the different post ids (from links)
+head(climoff_el)
+climoff_el<-mutate(climoff_el, sub = ifelse(post %in% climoff_sub$link, climoff_sub$author, NA)) #add in sub
+climoff_el<-mutate(climoff_el, com = ifelse(post %in% climoff_com$link, climoff_com$author, NA)) # add in comm
+
+
+
+climoff_el<-climoff_el %>%
+  group_by(com, sub)%>% ##can i group by both
+  summarize(weight = sum(edge))%>%
+  arrange(desc(weight))
+
+climoff_el_net<-network(climoff_el,directed = T,loops=T,matrix.type="edgelist") #create network
+
+#CREATE NODE ATTRIBUTE NETWORK ###########################################
+
+#create starting point
+climoff_node<-select(climoff,c(author,score,date,type))
+
+#look at personal score over time
+climoff_score<-select(climoff,c(author,score,date,type))%>%
+  group_by(author,type)%>%
+  summarise(score=sum(score))%>%
+  pivot_wider(names_from = type,values_from = score)%>%
+  mutate(score_total=sum(comment,submission))%>%
+  rename(,score_comment=comment,score_submission=submission)
+
+#look at initial engagement (time in subreddit), and type of first engagement
+climoff_start<-climoff_node[match(unique(climoff_node$author), climoff_node$author),]%>%
+  arrange(,date)%>%
+  mutate(age=as.numeric(as.Date("2023-12-31")-date,unit="weeks"))%>%
+  dplyr::rename(first_engagement = type)# add age
+
+#join info together
+climoff_node<-full_join(climoff_score,climoff_start, by="author")
+
+#add frequency of both activities
+climoff_freq<-select(climoff,c(author,score,date,type))%>%
+  group_by(author,type)%>%
+  mutate(count=1)%>%
+  summarise(freq=sum(count))%>%
+  pivot_wider(names_from = type,values_from = freq)%>%
+  mutate(freq_total=sum(comment,submission))%>%
+  rename(,freq_comment=comment,freq_submission=submission)
+
+#join info together
+climoff_node<-full_join(climoff_node,climoff_freq, by="author")
+
+climoff_node[is.na(climoff_node)] <- 0 #deal with NA values by counting them as 0 weights.
+
+
+#add to network
+network.vertex.names(climoff_el_net) <- as.character(climoff_node$author)
+climoff_el_net %v% "Age" <- climoff_node$age
+climoff_el_net %v% "First Engagement" <- climoff_node$first_engagement
+climoff_el_net %v% "Score" <- climoff_node$score_total
+climoff_el_net %v% "Comment Frequency" <- climoff_node$freq_comment
+climoff_el_net %v% "Submission Frequency" <- climoff_node$freq_submission
+
+
+{r descstatclimoff}
+rownames<-c("number of posts","number of comments","number of authors","average path length","outdegree","density","edgewise","dyadic","closeness","betweenness")
+
+library(igraph)
+climoff_igraph<-graph.edgelist(as.matrix(climoff_el[,1:2]))
+dist_climoff<-mean_distance(climoff_igraph)
+detach("package:igraph")
+
+climoff_values<-c(nrow(climoff_sub),nrow(climoff_com),length(climoff_node$author),dist_climoff,mean(degree(climoff_el_net,cmode="outdegree")),network.density(climoff_el_net),grecip(climoff_el_net, measure="edgewise"),grecip(climoff_el_net, measure="dyadic"),centralization(climoff_el_net, mode = "digraph",FUN = "closeness"),centralization(climoff_el_net, mode = "digraph",FUN = "betweenness"))
+
+descriptive_climoff<-data.frame(rownames,climoff_values)
+```
+
+Now, we are able to compare the structural elements of the different networks:
+```{r descriptive stats}
+descriptive_stats<-Reduce(function(x, y) merge(x, y, by="rownames"), list(descriptive_climoff,descriptive_clchaos,descriptive_exreb,descriptive_cliact,descriptive_grepar))
+
+knitr::kable(descriptive_stats, format="markdown")
+```
+
+We can also look at membership overlap between networks.
+```{r membershipoverlap}
+
+# Define the combinations of networks to compare
+comparisons_combos <- data.frame(
+  Network1 = c("climoff", "climoff", "climoff", "climoff", "clchaos", "clchaos", "clchaos", "cliact", "cliact", "exreb"),
+  Network2 = c("clchaos", "exreb", "cliact", "grepar", "exreb", "cliact", "grepar", "exreb", "grepar", "grepar")
+)
+
+
+intersections<-c(
+length(intersect(climoff_node$author, clchaos_node$author)),#27
+length(intersect(climoff_node$author, exreb_node$author)),#1652
+length(intersect(climoff_node$author, cliact_node$author)), #2462
+length(intersect(climoff_node$author, grepar_node$author)),#287
+length(intersect(clchaos_node$author, exreb_node$author)), #33
+length(intersect(clchaos_node$author, cliact_node$author)),#36
+length(intersect(clchaos_node$author, grepar_node$author)), #16
+length(intersect(cliact_node$author, exreb_node$author)), #993
+length(intersect(cliact_node$author, grepar_node$author)), #195
+length(intersect(exreb_node$author, grepar_node$author)))#216
+
+
+comparisons_membership<-cbind(comparisons_combos,intersections)
+
+#look at proportions
+Network1_length = c(length(climoff_node$author),
+                      length(climoff_node$author), 
+                      length(climoff_node$author), 
+                      length(climoff_node$author),
+                      length(clchaos_node$author),
+                      length(clchaos_node$author), 
+                      length(clchaos_node$author),
+                      length(cliact_node$author),
+                      length(cliact_node$author), 
+                      length(exreb_node$author))
+  
+Network2_length <- c(
+  length(clchaos_node$author),
+  length(exreb_node$author),
+  length(cliact_node$author),
+  length(grepar_node$author),
+  length(exreb_node$author),
+  length(cliact_node$author),
+  length(grepar_node$author),
+  length(exreb_node$author),
+  length(grepar_node$author),
+  length(grepar_node$author)
+)
+
+comparisons_membership$proportion_net1<-comparisons_membership$intersections/Network1_length
+
+comparisons_membership$proportion_net2<-comparisons_membership$intersections/Network2_length
+
+
+cor(comparisons_membership$intersections,comparisons_membership$proportion_net1)
+cor(comparisons_membership$intersections,comparisons_membership$proportion_net2) 
+
+
+knitr::kable(comparisons_membership,format="markdown")
+
+
+```
+
+
+##We now want to look at mentions of other subreddits: 
+
+
+```{r climoffmentions}
+
+## MENTIONS ##########################
+
+library(tm)
+
+tofindr<-c("r/")
+subreddits_out_climoff<-subset(climoff_com, grepl(paste(tofindr),text)) #look at subreddits as usernames are likely to be connected (though other also useful)
+
+
+subreddits_out_climoff$length<-nchar(subreddits_out_climoff$text)
+subreddits_out_climoff$freq<-as.numeric("1") #create length of comment
+
+#tokenise
+outdegree_mentions_climoff<-subreddits_out_climoff%>%
+  unnest_tokens(word,
+                text,
+                token = "regex",
+                to_lower = TRUE,
+                pattern = "\\s+")%>%
+  filter(str_detect(word, regex("^r/\\w+\\b")))#unnest tokens
+
+outdegree_mentions_climoff$word<-substring(outdegree_mentions_climoff$word,2)%>%
+  removePunctuation() #clean
+
+
+#now we a
+climoff_ment_avg_scores<-aggregate(score~ word, data=outdegree_mentions_climoff, FUN=mean)
+climoff_ment_total_scores<-aggregate(score~ word, data=outdegree_mentions_climoff, FUN=sum) ## high corr between frequency sum and total score. should do avg score instead.
+climoff_ment_lengths<-aggregate(length ~ word, data=outdegree_mentions_climoff, FUN=mean)
+climoff_ment_frequency<-aggregate(freq ~ word, data=outdegree_mentions_climoff, FUN=sum)
+
+climoff_ment_scores<-inner_join(climoff_ment_avg_scores, climoff_ment_total_scores, by="word")
+climoff_ment_agg<-inner_join(climoff_ment_scores, climoff_ment_lengths)
+climoff_ment_agg<-inner_join(climoff_ment_agg, climoff_ment_frequency)
+
+
+from<-data.frame(rep("climateoffensive",times=nrow(climoff_ment_agg))) #create the from variable
+colnames(from)<-"from"
+#bring together to create network
+climoff_ment_agg<-from%>%
+  cbind(climoff_ment_agg)%>%
+  rename(to=word,frequency="freq","average length"="length","mean score"="score.x","total score" ="score.y") ## RENAME 
+
+
+cor(climoff_ment_agg[,3:6]) # only issues of multicorr is with freq and total score
+
+length(climoff_ment_agg$to)==length(unique(climoff_ment_agg$to)) #good
+
+#we allow misspellings to be differnet as they will not link properly ##ADD
+
+
+#### 
+
+```
+
+
+```{r mentionsexreb}
+
+
+tofindr <- c("r/")
+subreddits_out_exreb <- subset(exreb_com, grepl(paste(tofindr), text)) #look at subreddits as usernames are likely to be connected (though other also useful)
+
+subreddits_out_exreb$length <- nchar(subreddits_out_exreb$text)
+subreddits_out_exreb$freq <- as.numeric("1") #create length of comment
+
+#tokenise
+outdegree_mentions_exreb <- subreddits_out_exreb %>%
+  unnest_tokens(word,
+                text,
+                token = "regex",
+                to_lower = TRUE,
+                pattern = "\\s+") %>%
+  filter(str_detect(word, regex("^r/\\w+\\b"))) #unnest tokens
+
+outdegree_mentions_exreb$word <- substring(outdegree_mentions_exreb$word, 2) %>%
+  removePunctuation() #clean
+
+#now we a
+exreb_ment_avg_scores <- aggregate(score ~ word, data = outdegree_mentions_exreb, FUN = mean)
+exreb_ment_total_scores <- aggregate(score ~ word, data = outdegree_mentions_exreb, FUN = sum) ## high corr between frequency sum and total score. should do avg score instead.
+exreb_ment_lengths <- aggregate(length ~ word, data = outdegree_mentions_exreb, FUN = mean)
+exreb_ment_frequency <- aggregate(freq ~ word, data = outdegree_mentions_exreb, FUN = sum)
+
+exreb_ment_scores <- inner_join(exreb_ment_avg_scores, exreb_ment_total_scores, by = "word")
+exreb_ment_agg <- inner_join(exreb_ment_scores, exreb_ment_lengths)
+exreb_ment_agg <- inner_join(exreb_ment_agg, exreb_ment_frequency)
+
+from <- data.frame(rep("exreb", times = nrow(exreb_ment_agg))) #create the from variable
+colnames(from) <- "from"
+#bring together to create network
+exreb_ment_agg <- from %>%
+  cbind(exreb_ment_agg) %>%
+  rename(to = word, frequency = "freq", "average length" = "length", "mean score" = "score.x", "total score" = "score.y") ## RENAME
+
+cor(exreb_ment_agg[, 3:6]) # only issues of multicorr is with freq and total score
+
+length(exreb_ment_agg$to) == length(unique(exreb_ment_agg$to)) #good
+
+#we allow misspellings to be differnet as they will not link properly ##ADD
+
+
+```
+
+
+```{r mentioncliact}
+
+tofindr <- c("r/")
+subreddits_out_cliact <- subset(cliact_com, grepl(paste(tofindr), text)) #look at subreddits as usernames are likely to be connected (though other also useful)
+
+subreddits_out_cliact$length <- nchar(subreddits_out_cliact$text)
+subreddits_out_cliact$freq <- as.numeric("1") #create length of comment
+
+#tokenise
+outdegree_mentions_cliact <- subreddits_out_cliact %>%
+  unnest_tokens(word,
+                text,
+                token = "regex",
+                to_lower = TRUE,
+                pattern = "\\s+") %>%
+  filter(str_detect(word, regex("^r/\\w+\\b"))) #unnest tokens
+
+outdegree_mentions_cliact$word <- substring(outdegree_mentions_cliact$word, 2) %>%
+  removePunctuation() #clean
+
+#now we a
+cliact_ment_avg_scores <- aggregate(score ~ word, data = outdegree_mentions_cliact, FUN = mean)
+cliact_ment_total_scores <- aggregate(score ~ word, data = outdegree_mentions_cliact, FUN = sum) ## high corr between frequency sum and total score. should do avg score instead.
+cliact_ment_lengths <- aggregate(length ~ word, data = outdegree_mentions_cliact, FUN = mean)
+cliact_ment_frequency <- aggregate(freq ~ word, data = outdegree_mentions_cliact, FUN = sum)
+
+cliact_ment_scores <- inner_join(cliact_ment_avg_scores, cliact_ment_total_scores, by = "word")
+cliact_ment_agg <- inner_join(cliact_ment_scores, cliact_ment_lengths)
+cliact_ment_agg <- inner_join(cliact_ment_agg, cliact_ment_frequency)
+
+from <- data.frame(rep("cliact", times = nrow(cliact_ment_agg))) #create the from variable
+colnames(from) <- "from"
+#bring together to create network
+cliact_ment_agg <- from %>%
+  cbind(cliact_ment_agg) %>%
+  rename(to = word, frequency = "freq", "average length" = "length", "mean score" = "score.x", "total score" = "score.y") ## RENAME
+
+cor(cliact_ment_agg[, 3:6]) # only issues of multicorr is with freq and total score
+
+length(cliact_ment_agg$to) == length(unique(cliact_ment_agg$to)) #good
+
+#we allow misspellings to be differnet as they will not link properly ##ADD 
+
+
+````
+
+
+
+```{r mentionsclchaos}
+
+tofindr <- c("r/")
+subreddits_out_clchaos <- subset(clchaos_com, grepl(paste(tofindr), text)) #look at subreddits as usernames are likely to be connected (though other also useful)
+
+subreddits_out_clchaos$length <- nchar(subreddits_out_clchaos$text)
+subreddits_out_clchaos$freq <- as.numeric("1") #create length of comment
+
+#tokenise
+outdegree_mentions_clchaos <- subreddits_out_clchaos %>%
+  unnest_tokens(word,
+                text,
+                token = "regex",
+                to_lower = TRUE,
+                pattern = "\\s+") %>%
+  filter(str_detect(word, regex("^r/\\w+\\b"))) #unnest tokens
+
+outdegree_mentions_clchaos$word <- substring(outdegree_mentions_clchaos$word, 2) %>%
+  removePunctuation() #clean
+
+#now we a
+clchaos_ment_avg_scores <- aggregate(score ~ word, data = outdegree_mentions_clchaos, FUN = mean)
+clchaos_ment_total_scores <- aggregate(score ~ word, data = outdegree_mentions_clchaos, FUN = sum) ## high corr between frequency sum and total score. should do avg score instead.
+clchaos_ment_lengths <- aggregate(length ~ word, data = outdegree_mentions_clchaos, FUN = mean)
+clchaos_ment_frequency <- aggregate(freq ~ word, data = outdegree_mentions_clchaos, FUN = sum)
+
+clchaos_ment_scores <- inner_join(clchaos_ment_avg_scores, clchaos_ment_total_scores, by = "word")
+clchaos_ment_agg <- inner_join(clchaos_ment_scores, clchaos_ment_lengths)
+clchaos_ment_agg <- inner_join(clchaos_ment_agg, clchaos_ment_frequency)
+
+from <- data.frame(rep("clchaos", times = nrow(clchaos_ment_agg))) #create the from variable
+colnames(from) <- "from"
+#bring together to create network
+clchaos_ment_agg <- from %>%
+  cbind(clchaos_ment_agg) %>%
+  rename(to = word, frequency = "freq", "average length" = "length", "mean score" = "score.x", "total score" = "score.y") ## RENAME
+
+cor(clchaos_ment_agg[, 3:6]) # only issues of multicorr is with freq and total score
+
+length(clchaos_ment_agg$to) == length(unique(clchaos_ment_agg$to)) #good
+
+#we allow misspellings to be differnet as they will not link properly ##ADD 
+
+
+
+```
+
+
+
+Here, we look at r/climatechaos to show that it is completely based on bot posts.
+```{r clchaosmention}
+
+head(clchaos_el)
+tail(clchaos_el)
+clchaos_el[clchaos_el$sub != "u/climatechaosbot", ] #none
+
+plot(clchaos_el_net,main="Climate Chaos")
+
+plot(climoff_el_net,main="Climate Offensive")
+
+
+```
+
+
+```{r greparmention}
+
+tofindr <- c("r/")
+subreddits_out_grepar <- subset(grepar_com, grepl(paste(tofindr), text)) #look at subreddits as usernames are likely to be connected (though other also useful)
+
+subreddits_out_grepar$length <- nchar(subreddits_out_grepar$text)
+subreddits_out_grepar$freq <- as.numeric("1") #create length of comment
+
+#tokenise
+outdegree_mentions_grepar <- subreddits_out_grepar %>%
+  unnest_tokens(word,
+                text,
+                token = "regex",
+                to_lower = TRUE,
+                pattern = "\\s+") %>%
+  filter(str_detect(word, regex("^r/\\w+\\b"))) #unnest tokens
+
+outdegree_mentions_grepar$word <- substring(outdegree_mentions_grepar$word, 2) %>%
+  removePunctuation() #clean
+
+#now we a
+grepar_ment_avg_scores <- aggregate(score ~ word, data = outdegree_mentions_grepar, FUN = mean)
+grepar_ment_total_scores <- aggregate(score ~ word, data = outdegree_mentions_grepar, FUN = sum) ## high corr between frequency sum and total score. should do avg score instead.
+grepar_ment_lengths <- aggregate(length ~ word, data = outdegree_mentions_grepar, FUN = mean)
+grepar_ment_frequency <- aggregate(freq ~ word, data = outdegree_mentions_grepar, FUN = sum)
+
+grepar_ment_scores <- inner_join(grepar_ment_avg_scores, grepar_ment_total_scores, by = "word")
+grepar_ment_agg <- inner_join(grepar_ment_scores, grepar_ment_lengths)
+grepar_ment_agg <- inner_join(grepar_ment_agg, grepar_ment_frequency)
+
+from <- data.frame(rep("grepar", times = nrow(grepar_ment_agg))) #create the from variable
+colnames(from) <- "from"
+#bring together to create network
+grepar_ment_agg <- from %>%
+  cbind(grepar_ment_agg) %>%
+  rename(to = word, frequency = "freq", "average length" = "length", "mean score" = "score.x", "total score" = "score.y") ## RENAME
+
+cor(grepar_ment_agg[, 3:6]) # only issues of multicorr is with freq and total score
+
+length(grepar_ment_agg$to) == length(unique(grepar_ment_agg$to)) #good
+
+#we allow misspellings to be differnet as they will not link properly ##ADD 
+
+```
+
+
+```{r allmentionslevel1}
+
+mentions_aggregated<-rbind(grepar_ment_agg, climoff_ment_agg, cliact_ment_agg, clchaos_ment_agg)
+
+#add exreb once that bit of code is debugged
+
+mentions_aggregated_to<-group(mentions_aggregated)
+
+
+mentions_network_level1<-network(mentions_aggregated,loops=T,matrix.type="edgelist")
+
+### look at the twos
+
+mentioned_lvl1 <- mentions_aggregated[, c("to", "frequency")] %>%
+  group_by(to) %>% #remember to group
+  summarise(frequency = sum(frequency)) %>%
+  arrange(desc(frequency)) #simple
+
+
+
+
+View(head(mentioned_lvl1,n=50))
+
+
+We now add sentiment to all nodes, looking at three different measures of sentiment.
+
+
+```
+
+
+```{r sentclimoff}
+
+#make corpus
+climoff_corpus <- corpus(climoff, text_field = "text")
+
+#AFINN
+#tokenise
+afinn_sentiment_climoff <- climoff %>%
+    unnest_tokens(word, text, token = "words") %>%
+    inner_join(get_sentiments("afinn"))%>%
+  subset(, select = c(author,value) )%>% #take away word to allow collapse
+   group_by(author) %>%
+    summarize(average_sentiment_af = mean(value))
+  
+#join to node attributes
+climoff_node<-inner_join(climoff_node,afinn_sentiment_climoff)
+climoff_el_net %v% "Afinn Sentiment" <- climoff_node$average_sentiment_af
+
+
+#BING
+bing_sentiment_climoff <- climoff %>%
+  unnest_tokens(word, text, token = "words") %>%
+  inner_join(get_sentiments("bing")) %>%
+  select(author, sentiment) %>%
+  group_by(author) %>%
+  summarise(
+    positive_proportion = sum(sentiment == "positive") / n(),
+    negative_proportion = sum(sentiment == "negative") / n()
+  )
+              
+              
+#join to node attributes
+climoff_node<-inner_join(climoff_node,bing_sentiment_climoff)
+climoff_el_net %v% "Bing Sentiment" <- climoff_node$positive_proportion
+
+#NRC
+
+nrc_sentiment_climoff <- climoff %>%
+    unnest_tokens(word, text, token = "words") %>%
+    inner_join(get_sentiments("nrc")) %>%
+    filter(sentiment %in% c("anger", "fear", "sadness", "trust", "joy")) %>%
+    group_by(author) %>%
+    summarize(
+        average_anger = mean(as.numeric(sentiment == "anger")),
+        average_fear = mean(as.numeric(sentiment == "fear")),
+        average_sadness = mean(as.numeric(sentiment == "sadness")),
+        average_trust = mean(as.numeric(sentiment == "trust")),
+        average_joy = mean(as.numeric(sentiment == "joy"))
+    )
+
+#join to node attributes
+climoff_node<-inner_join(climoff_node,nrc_sentiment_climoff)
+climoff_el_net %v% "NRC_anger" <- climoff_node$average_anger
+climoff_el_net %v% "NRC_fear" <- climoff_node$average_fear
+climoff_el_net %v% "NRC_sadness" <- climoff_node$average_sadness
+climoff_el_net %v% "NRC_trust" <- climoff_node$average_trust
+climoff_el_net %v% "NRC_joy" <- climoff_node$average_joy
+
+
+````
+
+```{r sentcliact}
+#make corpus
+cliact_corpus <- corpus(cliact, text_field = "text")
+
+#AFINN
+#tokenise
+afinn_sentiment_cliact <- cliact %>%
+    unnest_tokens(word, text, token = "words") %>%
+    inner_join(get_sentiments("afinn"))%>%
+  subset(, select = c(author,value) )%>% #take away word to allow collapse
+   group_by(author) %>%
+    summarize(average_sentiment_af = mean(value))
+  
+#join to node attributes
+cliact_node <- inner_join(cliact_node, afinn_sentiment_cliact)
+cliact_el_net %v% "Afinn Sentiment" <- cliact_node$average_sentiment_af
+
+#BING
+bing_sentiment_cliact <- cliact %>%
+  unnest_tokens(word, text, token = "words") %>%
+  inner_join(get_sentiments("bing")) %>%
+  select(author, sentiment) %>%
+  group_by(author) %>%
+  summarise(
+    positive_proportion = sum(sentiment == "positive") / n(),
+    negative_proportion = sum(sentiment == "negative") / n()
+  )
+              
+#join to node attributes
+cliact_node <- inner_join(cliact_node, bing_sentiment_cliact)
+cliact_el_net %v% "Bing Sentiment" <- cliact_node$positive_proportion
+
+#NRC
+nrc_sentiment_cliact <- cliact %>%
+    unnest_tokens(word, text, token = "words") %>%
+    inner_join(get_sentiments("nrc")) %>%
+    filter(sentiment %in% c("anger", "fear", "sadness", "trust", "joy")) %>%
+    group_by(author) %>%
+    summarize(
+        average_anger = mean(as.numeric(sentiment == "anger")),
+        average_fear = mean(as.numeric(sentiment == "fear")),
+        average_sadness = mean(as.numeric(sentiment == "sadness")),
+        average_trust = mean(as.numeric(sentiment == "trust")),
+        average_joy = mean(as.numeric(sentiment == "joy"))
+    )
+
+#join to node attributes
+cliact_node <- inner_join(cliact_node, nrc_sentiment_cliact)
+cliact_el_net %v% "NRC_anger" <- cliact_node$average_anger
+cliact_el_net %v% "NRC_fear" <- cliact_node$average_fear
+cliact_el_net %v% "NRC_sadness" <- cliact_node$average_sadness
+cliact_el_net %v% "NRC_trust" <- cliact_node$average_trust
+cliact_el_net %v% "NRC_joy" <- cliact_node$average_joy
+```
+
+```{r sentgrepar}
+#make corpus
+grepar_corpus <- corpus(grepar, text_field = "text")
+
+#AFINN
+#tokenize
+afinn_sentiment_grepar <- grepar %>%
+    unnest_tokens(word, text, token = "words") %>%
+    inner_join(get_sentiments("afinn"))%>%
+  subset(, select = c(author,value) )%>% #take away word to allow collapse
+   group_by(author) %>%
+    summarize(average_sentiment_af = mean(value))
+  
+#join to node attributes
+grepar_node <- inner_join(grepar_node, afinn_sentiment_grepar)
+grepar_el_net %v% "Afinn Sentiment" <- grepar_node$average_sentiment_af
+
+#BING
+bing_sentiment_grepar <- grepar %>%
+  unnest_tokens(word, text, token = "words") %>%
+  inner_join(get_sentiments("bing")) %>%
+  select(author, sentiment) %>%
+  group_by(author) %>%
+  summarise(
+    positive_proportion = sum(sentiment == "positive") / n(),
+    negative_proportion = sum(sentiment == "negative") / n()
+  )
+              
+#join to node attributes
+grepar_node <- inner_join(grepar_node, bing_sentiment_grepar)
+grepar_el_net %v% "Bing Sentiment" <- grepar_node$positive_proportion
+
+#NRC
+nrc_sentiment_grepar <- grepar %>%
+    unnest_tokens(word, text, token = "words") %>%
+    inner_join(get_sentiments("nrc")) %>%
+    filter(sentiment %in% c("anger", "fear", "sadness", "trust", "joy")) %>%
+    group_by(author) %>%
+    summarize(
+        average_anger = mean(as.numeric(sentiment == "anger")),
+        average_fear = mean(as.numeric(sentiment == "fear")),
+        average_sadness = mean(as.numeric(sentiment == "sadness")),
+        average_trust = mean(as.numeric(sentiment == "trust")),
+        average_joy = mean(as.numeric(sentiment == "joy"))
+    )
+
+#join to node attributes
+grepar_node <- inner_join(grepar_node, nrc_sentiment_grepar)
+grepar_el_net %v% "NRC_anger" <- grepar_node$average_anger
+grepar_el_net %v% "NRC_fear" <- grepar_node$average_fear
+grepar_el_net %v% "NRC_sadness" <- grepar_node$average_sadness
+grepar_el_net %v% "NRC_trust" <- grepar_node$average_trust
+grepar_el_net %v% "NRC_joy" <- grepar_node$average_joy
+```
+
+```{r sentclchaos}
+#make corpus
+clchaos_corpus <- corpus(clchaos, text_field = "text")
+
+#AFINN
+#tokenize
+afinn_sentiment_clchaos <- clchaos %>%
+    unnest_tokens(word, text, token = "words") %>%
+    inner_join(get_sentiments("afinn"))%>%
+  subset(, select = c(author,value) )%>% #take away word to allow collapse
+   group_by(author) %>%
+    summarize(average_sentiment_af = mean(value))
+  
+#join to node attributes
+clchaos_node <- inner_join(clchaos_node, afinn_sentiment_clchaos)
+clchaos_el_net %v% "Afinn Sentiment" <- clchaos_node$average_sentiment_af
+
+#BING
+bing_sentiment_clchaos <- clchaos %>%
+  unnest_tokens(word, text, token = "words") %>%
+  inner_join(get_sentiments("bing")) %>%
+  select(author, sentiment) %>%
+  group_by(author) %>%
+  summarise(
+    positive_proportion = sum(sentiment == "positive") / n(),
+    negative_proportion = sum(sentiment == "negative") / n()
+  )
+              
+#join to node attributes
+clchaos_node <- inner_join(clchaos_node, bing_sentiment_clchaos)
+clchaos_el_net %v% "Bing Sentiment" <- clchaos_node$positive_proportion
+
+#NRC
+nrc_sentiment_clchaos <- clchaos %>%
+    unnest_tokens(word, text, token = "words") %>%
+    inner_join(get_sentiments("nrc")) %>%
+    filter(sentiment %in% c("anger", "fear", "sadness", "trust", "joy")) %>%
+    group_by(author) %>%
+    summarize(
+        average_anger = mean(as.numeric(sentiment == "anger")),
+        average_fear = mean(as.numeric(sentiment == "fear")),
+        average_sadness = mean(as.numeric(sentiment == "sadness")),
+        average_trust = mean(as.numeric(sentiment == "trust")),
+        average_joy = mean(as.numeric(sentiment == "joy"))
+    )
+
+#join to node attributes
+clchaos_node <- inner_join(clchaos_node, nrc_sentiment_clchaos)
+clchaos_el_net %v% "NRC_anger" <- clchaos_node$average_anger
+clchaos_el_net %v% "NRC_fear" <- clchaos_node$average_fear
+clchaos_el_net %v% "NRC_sadness" <- clchaos_node$average_sadness
+clchaos_el_net %v% "NRC_trust" <- clchaos_node$average_trust
+clchaos_el_net %v% "NRC_joy" <- clchaos_node$average_joy
+```
+
+```{r sentexreb}
+#make corpus
+exreb_corpus <- corpus(exreb, text_field = "text")
+
+#AFINN
+#tokenize
+afinn_sentiment_exreb <- exreb %>%
+    unnest_tokens(word, text, token = "words") %>%
+    inner_join(get_sentiments("afinn"))%>%
+  subset(, select = c(author,value) )%>% #take away word to allow collapse
+   group_by(author) %>%
+    summarize(average_sentiment_af = mean(value))
+  
+#join to node attributes
+exreb_node <- inner_join(exreb_node, afinn_sentiment_exreb)
+exreb_el_net %v% "Afinn Sentiment" <- exreb_node$average_sentiment_af
+
+#BING
+bing_sentiment_exreb <- exreb %>%
+  unnest_tokens(word, text, token = "words") %>%
+  inner_join(get_sentiments("bing")) %>%
+  select(author, sentiment) %>%
+  group_by(author) %>%
+  summarise(
+    positive_proportion = sum(sentiment == "positive") / n(),
+    negative_proportion = sum(sentiment == "negative") / n()
+  )
+              
+#join to node attributes
+exreb_node <- inner_join(exreb_node, bing_sentiment_exreb)
+exreb_el_net %v% "Bing Sentiment" <- exreb_node$positive_proportion
+
+#NRC
+nrc_sentiment_exreb <- exreb %>%
+    unnest_tokens(word, text, token = "words") %>%
+    inner_join(get_sentiments("nrc")) %>%
+    filter(sentiment %in% c("anger", "fear", "sadness", "trust", "joy")) %>%
+    group_by(author) %>%
+    summarize(
+        average_anger = mean(as.numeric(sentiment == "anger")),
+        average_fear = mean(as.numeric(sentiment == "fear")),
+        average_sadness = mean(as.numeric(sentiment == "sadness")),
+        average_trust = mean(as.numeric(sentiment == "trust")),
+        average_joy = mean(as.numeric(sentiment == "joy"))
+    )
+
+#join to node attributes
+exreb_node <- inner_join(exreb_node, nrc_sentiment_exreb)
+exreb_el_net %v% "NRC_anger" <- exreb_node$average_anger
+exreb_el_net %v% "NRC_fear" <- exreb_node$average_fear
+exreb_el_net %v% "NRC_sadness" <- exreb_node$average_sadness
+exreb_el_net %v% "NRC_trust" <- exreb_node$average_trust
+exreb_el_net %v% "NRC_joy" <- exreb_node$average_joy
+```
+
+We then move on to the ergm models for each.
+```{r ergmclimoff}
+set.seed(1029)
+model02_climoff<- ergm(climoff_el_net ~ 
+                  edges +
+                  mutual +
+                  nodematch("Afinn Sentiment") +
+                  nodematch("Bing Sentiment") +
+                  nodematch("Submission Frequency") +
+                  nodefactor("First Engagement") +
+                  nodematch("NRC_anger") +
+                  nodematch("NRC_fear") +
+                  nodematch("NRC_sadness") +
+                  nodematch("NRC_trust") +
+                  nodematch("NRC_joy"))
+
+#take off those that do not make sense
+set.seed(1028)
+model01_climoff <- ergm(climoff_el_net ~ 
+                  edges +
+                  mutual +
+                  nodematch("Bing Sentiment") +
+                  nodematch("Submission Frequency") +
+                  nodefactor("First Engagement") +
+                  nodematch("NRC_anger") +
+                  nodematch("NRC_fear") +
+                  nodematch("NRC_joy"))
+
+
+
+```
+
+```{r ergmcliact}
+set.seed(1021)
+model02_cliact <- ergm(cliact_el_net ~ 
+                  edges +
+                  mutual +
+                  nodematch("Afinn Sentiment") +
+                  nodematch("Bing Sentiment") +
+                  nodematch("Submission Frequency") +
+                  nodefactor("First Engagement") +
+                  nodematch("NRC_anger") +
+                  nodematch("NRC_fear") +
+                  nodematch("NRC_sadness") +
+                  nodematch("NRC_trust") +
+                  nodematch("NRC_joy"))
+
+#take off those that do not make sense
+set.seed(1023)
+model01_cliact <- ergm(cliact_el_net ~ 
+                  edges +
+                  mutual +
+                  nodematch("Bing Sentiment") +
+                  nodematch("Submission Frequency") +
+                  nodefactor("First Engagement") +
+                  nodematch("NRC_anger") +
+                  nodematch("NRC_fear") +
+                  nodematch("NRC_joy"))
+
+#CLIACT HAS NOT SIGNIFICANT NRC VALUES
+```
+
+```{r ergmexreb}
+set.seed(1234)
+model02_exreb <- ergm(exreb_el_net ~ 
+                  edges +
+                  mutual +
+                  nodematch("Afinn Sentiment") +
+                  nodematch("Bing Sentiment") +
+                  nodematch("Submission Frequency") +
+                  nodefactor("First Engagement") +
+                  nodematch("NRC_anger") +
+                  nodematch("NRC_fear") +
+                  nodematch("NRC_sadness") +
+                  nodematch("NRC_trust") +
+                  nodematch("NRC_joy"))
+
+
+#take off those that do not make sense
+set.seed(1230)
+model01_exreb <- ergm(exreb_el_net ~ 
+                  edges +
+                  mutual +
+                  nodematch("Submission Frequency") +
+                  nodefactor("First Engagement") +
+                  nodematch("NRC_trust"))
+
+
+
+summary(exreb_node$average_trust)
+summary(climoff_node$average_trust)
+summary(cliact_node$average_trust)
+
+```
+
+```{r ergmclchaos}
+set.seed(12309)
+model02_clchaos <- ergm(clchaos_el_net ~ 
+                  edges +
+                  mutual +
+                  nodematch("Afinn Sentiment") +
+                  nodematch("Bing Sentiment") +
+                  nodematch("Submission Frequency") +
+                  nodematch("NRC_anger") +
+                  nodematch("NRC_fear") +
+                  nodematch("NRC_sadness") +
+                  nodematch("NRC_trust") +
+                  nodematch("NRC_joy"))
+
+
+#take off those that do not make sense
+set.seed(12390)
+model01_clchaos <- ergm(clchaos_el_net ~ 
+                  edges +
+                  mutual +
+                  nodematch("Bing Sentiment") +
+                  nodematch("Submission Frequency") +
+                  nodematch("NRC_anger") +
+                  nodematch("NRC_fear") +
+                  nodematch("NRC_joy"))
+
+```
+
+```{r ergmgrepar}
+set.seed(1029)
+model02_grepar <- ergm(grepar_el_net ~ 
+                  edges +
+                  mutual +
+                  nodematch("Afinn Sentiment") +
+                  nodematch("Bing Sentiment") +
+                  nodematch("Submission Frequency") +
+                  nodefactor("First Engagement") +
+                  nodematch("NRC_anger") +
+                  nodematch("NRC_fear") +
+                  nodematch("NRC_sadness") +
+                  nodematch("NRC_trust") +
+                  nodematch("NRC_joy"))
+
+
+
+#take off those that do not make sense
+set.seed(1028)
+model01_grepar <- ergm(grepar_el_net ~ 
+                  edges +
+                  mutual +
+                  nodematch("Bing Sentiment") +
+                  nodematch("Submission Frequency") +
+                  nodefactor("First Engagement") +
+                  nodematch("NRC_fear"))
+
+```
+
+```{r ergmsummary}
+# List of your ergm models
+models <- list(model01_cliact, model02_cliact, model01_climoff, model02_climoff,
+               model01_clchaos, model02_clchaos, model01_exreb, model02_exreb,
+               model01_grepar, model02_grepar)
+
+
+model_names <- c("model02_cliact", "model01_cliact", "model02_climoff", "model01_climoff", "model02_clchaos", "model01_clchaos", "model02_exreb", "model01_exreb", "model02_grepar", "model01_grepar")  
+
+
+for (model_name in model_names) {
+  print(model_name)
+  print(summary(get(model_name)))
+}
+```
+Finally, we test these models to allow for comparison based on purpose.
+
+```{r goftests}
+gof.choices <- control.gof.ergm(nsim=100)
+
+?control.gof.ergm
+
+models <- list(model01_cliact, model02_cliact, model01_climoff, model02_climoff,
+               model01_clchaos, model02_clchaos, model01_exreb, model02_exreb,
+               model01_grepar, model02_grepar)
+
+
+summary(model02_climoff)
+gof_results <- list()
+
+model_names<- c("model01_cliact", "model02_cliact", "model01_climoff", "model02_climoff",
+               "model01_clchaos", "model02_clchaos", "model01_exreb", "model02_exreb",
+               "model01_grepar", "model02_grepar")
+
+for (model_name in model_names) {
+  # Perform goodness-of-fit test
+  gof_result <- gof(get(model_name), GOF = ~ model, control = gof.choices)
+  
+  # Store the result in the list
+  gof_results[[model_name]] <- gof_result
+  
+  # Print the results
+  print(gof_result)
+}
+
+summary(gof_results)
+
+gof_dfs<-list()
+
+variables<-c("edges","mutual") #set some basic seed for join
+
+gof_pvalues_df<-data.frame(variables)
+colnames(gof_pvalues_df)<- c("variables") #name column to join to
+
+for (model_name in model_names){
+ p_values <- gof_results[[model_name]]$pval.model
+  gof_df <- data.frame(p_value = p_values)
+  gof_df<-data.frame(rownames(gof_df),gof_df[,5])#only want to compare to model, and want to know which vars
+  colnames(gof_df)<-c("variables","p-value")
+  gof_dfs[[model_name]] <- gof_df
+  gof_pvalues_df<-full_join(gof_pvalues_df,gof_df,by="variables")
+}
+
+colnames(gof_pvalues_df)<-c("variables",model_names) #set names
+
+knitr::kable(gof_pvalues_df, format="markdown")
+
+```
